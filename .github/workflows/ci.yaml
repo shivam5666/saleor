@@ -1,0 +1,68 @@
+# Copy to: <your fork of saleor>/.github/workflows/ci.yaml
+# Flow: build image -> push to ECR -> saleor-gitops repo mein image tag update -> Argo CD deploy
+#
+# Repo Settings -> Secrets and variables -> Actions:
+#   Secret   AWS_ROLE_ARN   = arn:aws:iam::<ACCOUNT_ID>:role/github-actions-ecr-push
+#   Secret   GITOPS_TOKEN   = fine-grained PAT (sirf saleor-gitops repo, Contents: Read and write)
+#   Variable AWS_REGION     = ap-south-1
+name: saleor-api CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # GitHub OIDC -> AWS (no access keys)
+  contents: read
+
+env:
+  ECR_REPO: saleor-api
+  GITOPS_REPO: ${{ github.repository_owner }}/saleor-gitops
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3   # Saleor Dockerfile BuildKit cache mounts use karta hai
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Update image tag in manifests
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
+        run: |
+          cd gitops
+          # api, worker, beat aur migrate job: sab ek hi image use karte hain
+          sed -i -E "s#image: .*/${ECR_REPO}:.*#image: ${IMAGE}#" k8s/*.yaml
+          git diff --stat
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "saleor-api: deploy ${GITHUB_SHA::7}" || echo "No changes"
+          git push
